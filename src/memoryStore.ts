@@ -9,16 +9,23 @@
 
 import { randomUUID } from "node:crypto";
 import {
+  ABSTAIN,
+  type CastVoteInput,
   type Council,
   CoordinationError,
   type CreateCouncilInput,
+  type CreateProposalInput,
   type JoinCouncilInput,
   type Membership,
   type Message,
+  type MessageKind,
+  type Proposal,
   type RegisterSessionInput,
   type SendMessageInput,
   type Session,
   type Store,
+  type Tally,
+  type Vote,
 } from "./store.js";
 
 /** Short, human-glanceable id — enough entropy for a council, easier to paste. */
@@ -35,6 +42,25 @@ function memberKey(councilId: string, sessionId: string): string {
   return `${councilId}:${sessionId}`;
 }
 
+/** Trim, drop blanks, de-duplicate, and validate a proposal's options. */
+function normalizeOptions(raw?: string[]): string[] {
+  const provided = (raw ?? ["yes", "no"])
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0);
+  const unique = [...new Set(provided)];
+  if (unique.length < 2) {
+    throw new CoordinationError(
+      "A proposal needs at least two distinct options.",
+    );
+  }
+  if (unique.some((o) => o.toLowerCase() === ABSTAIN)) {
+    throw new CoordinationError(
+      `"${ABSTAIN}" is reserved and always available — don't list it as an option.`,
+    );
+  }
+  return unique;
+}
+
 export class MemoryStore implements Store {
   private sessions = new Map<string, Session>();
   private sessionIdByName = new Map<string, string>(); // name -> sessionId (uniqueness)
@@ -42,6 +68,8 @@ export class MemoryStore implements Store {
   private memberships = new Map<string, Membership>(); // `${councilId}:${sessionId}`
   private messages = new Map<string, Message[]>(); // councilId -> ordered messages
   private seqByCouncil = new Map<string, number>(); // councilId -> last seq used
+  private proposals = new Map<string, Proposal>(); // proposalId -> Proposal
+  private votes = new Map<string, Map<string, Vote>>(); // proposalId -> (sessionId -> Vote)
 
   async registerSession(input: RegisterSessionInput): Promise<Session> {
     const name = input.name.trim();
@@ -188,22 +216,157 @@ export class MemoryStore implements Store {
       );
     }
 
-    const seq = (this.seqByCouncil.get(input.councilId) ?? 0) + 1;
-    this.seqByCouncil.set(input.councilId, seq);
+    return this.appendMessage(sender, toSessionId, kind, input.content);
+  }
+
+  /** Append a message to a council's log, bumping the per-council seq. The
+   * caller is responsible for membership/recipient/permission checks. */
+  private appendMessage(
+    sender: Membership,
+    toSessionId: string | null,
+    kind: MessageKind,
+    content: string,
+  ): Message {
+    const seq = (this.seqByCouncil.get(sender.councilId) ?? 0) + 1;
+    this.seqByCouncil.set(sender.councilId, seq);
 
     const message: Message = {
       id: shortId(),
-      councilId: input.councilId,
+      councilId: sender.councilId,
       seq,
       fromSessionId: sender.sessionId,
       fromName: sender.name,
       toSessionId,
       kind,
-      content: input.content,
+      content,
       createdAt: now(),
     };
-    this.messages.get(input.councilId)!.push(message);
+    this.messages.get(sender.councilId)!.push(message);
     return message;
+  }
+
+  async createProposal(input: CreateProposalInput): Promise<Proposal> {
+    const council = this.councils.get(input.councilId);
+    if (!council) {
+      throw new CoordinationError(`No council with id "${input.councilId}".`);
+    }
+    const proposer = this.memberships.get(
+      memberKey(input.councilId, input.sessionId),
+    );
+    if (!proposer) {
+      throw new CoordinationError(
+        `Session "${input.sessionId}" is not a member of council "${input.councilId}".`,
+      );
+    }
+    const text = input.text.trim();
+    if (text.length === 0) {
+      throw new CoordinationError("A proposal must have text.");
+    }
+    const options = normalizeOptions(input.options);
+
+    const proposal: Proposal = {
+      id: shortId(),
+      councilId: input.councilId,
+      text,
+      options,
+      proposedBySessionId: proposer.sessionId,
+      proposedByName: proposer.name,
+      createdAt: now(),
+    };
+    this.proposals.set(proposal.id, proposal);
+    this.votes.set(proposal.id, new Map());
+
+    // Announce it in the feed so other members can discover and vote on it.
+    this.appendMessage(
+      proposer,
+      null,
+      "proposal",
+      `Proposal ${proposal.id}: ${text}  [options: ${options.join(
+        " / ",
+      )} / ${ABSTAIN} — vote with cast_vote]`,
+    );
+
+    return proposal;
+  }
+
+  async getProposal(proposalId: string): Promise<Proposal | undefined> {
+    return this.proposals.get(proposalId);
+  }
+
+  async castVote(input: CastVoteInput): Promise<Vote> {
+    const council = this.councils.get(input.councilId);
+    if (!council) {
+      throw new CoordinationError(`No council with id "${input.councilId}".`);
+    }
+    const voter = this.memberships.get(
+      memberKey(input.councilId, input.sessionId),
+    );
+    if (!voter) {
+      throw new CoordinationError(
+        `Session "${input.sessionId}" is not a member of council "${input.councilId}".`,
+      );
+    }
+    const proposal = this.proposals.get(input.proposalId);
+    if (!proposal || proposal.councilId !== input.councilId) {
+      throw new CoordinationError(
+        `No proposal "${input.proposalId}" in council "${input.councilId}".`,
+      );
+    }
+    const choice = input.choice.trim();
+    const isAbstain = choice.toLowerCase() === ABSTAIN;
+    if (!isAbstain && !proposal.options.includes(choice)) {
+      throw new CoordinationError(
+        `"${choice}" is not a valid choice. Pick one of: ${proposal.options.join(
+          ", ",
+        )}, or ${ABSTAIN}.`,
+      );
+    }
+
+    const vote: Vote = {
+      proposalId: proposal.id,
+      sessionId: voter.sessionId,
+      choice: isAbstain ? ABSTAIN : choice,
+      castAt: now(),
+    };
+    // Last vote wins: one ballot per session per proposal.
+    this.votes.get(proposal.id)!.set(voter.sessionId, vote);
+    return vote;
+  }
+
+  async tally(councilId: string, proposalId: string): Promise<Tally> {
+    const council = this.councils.get(councilId);
+    if (!council) {
+      throw new CoordinationError(`No council with id "${councilId}".`);
+    }
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal || proposal.councilId !== councilId) {
+      throw new CoordinationError(
+        `No proposal "${proposalId}" in council "${councilId}".`,
+      );
+    }
+
+    const counts: Record<string, number> = {};
+    for (const option of proposal.options) counts[option] = 0;
+    let abstain = 0;
+
+    const ballots = this.votes.get(proposalId) ?? new Map<string, Vote>();
+    for (const vote of ballots.values()) {
+      if (vote.choice === ABSTAIN) abstain += 1;
+      else if (vote.choice in counts) counts[vote.choice] += 1;
+    }
+
+    const members = [...this.memberships.values()].filter(
+      (m) => m.councilId === councilId,
+    ).length;
+
+    return {
+      proposalId,
+      text: proposal.text,
+      counts,
+      abstain,
+      voted: ballots.size,
+      members,
+    };
   }
 
   async getMessages(

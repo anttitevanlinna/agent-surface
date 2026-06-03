@@ -244,3 +244,36 @@ test("listParticipants returns members in join order with chair flagged", async 
   assert.equal(members[0].isChair, true);
   assert.equal(members[1].isChair, false);
 });
+
+test("votes are counted, including zeros and abstentions, with turnout", async () => {
+  const { store, councilId, chair, alice, bob } = await council();
+  const proposal = await store.createProposal({
+    councilId,
+    sessionId: chair.id,
+    text: "Ship v2 today?",
+    options: ["ship", "wait"],
+  });
+  await store.castVote({
+    councilId,
+    sessionId: alice.id,
+    proposalId: proposal.id,
+    choice: "wait",
+  });
+  await store.castVote({
+    councilId,
+    sessionId: bob.id,
+    proposalId: proposal.id,
+    choice: "wait",
+  });
+  await store.castVote({
+    councilId,
+    sessionId: chair.id,
+    proposalId: proposal.id,
+    choice: "abstain",
+  });
+
+  const result = await store.tally(councilId, proposal.id);
+  assert.deepEqual(result.counts, { ship: 0, wait: 2 });
+  assert.equal(result.abstain, 1);
+  assert.equal(result.voted, 3);
+});

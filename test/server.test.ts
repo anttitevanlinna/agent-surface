@@ -52,21 +52,75 @@ async function register(client: Client, name: string): Promise<string> {
   return field(res.text, "sessionId");
 }
 
-test("tools/list exposes all seven tools", async () => {
+test("tools/list exposes all ten tools", async () => {
   const client = await connect(new MemoryStore());
   const { tools } = await client.listTools();
   assert.deepEqual(
     tools.map((t) => t.name).sort(),
     [
+      "cast_vote",
       "create_council",
+      "create_proposal",
       "get_messages",
       "join_council",
       "list_councils",
       "list_participants",
       "register_session",
       "send_message",
+      "tally",
     ],
   );
+});
+
+test("propose, vote, and tally over MCP", async () => {
+  const store = new MemoryStore();
+  const chair = await connect(store);
+  const expert = await connect(store);
+
+  const chairSession = await register(chair, "Chair");
+  const aliceSession = await register(expert, "Alice");
+  const created = await callText(chair, "create_council", {
+    topic: "Ship v2 today?",
+    session: chairSession,
+  });
+  const councilId = field(created.text, "councilId");
+  await callText(expert, "join_council", {
+    councilId,
+    session: aliceSession,
+  });
+
+  const proposed = await callText(chair, "create_proposal", {
+    councilId,
+    session: chairSession,
+    text: "Ship v2 today?",
+    options: ["ship", "wait"],
+  });
+  const proposalId = field(proposed.text, "proposalId");
+
+  // Alice discovers the proposal by polling her feed.
+  const feed = await callText(expert, "get_messages", {
+    councilId,
+    session: aliceSession,
+  });
+  assert.match(feed.text, new RegExp(proposalId));
+
+  await callText(chair, "cast_vote", {
+    councilId,
+    session: chairSession,
+    proposalId,
+    choice: "wait",
+  });
+  await callText(expert, "cast_vote", {
+    councilId,
+    session: aliceSession,
+    proposalId,
+    choice: "wait",
+  });
+
+  const result = await callText(chair, "tally", { councilId, proposalId });
+  assert.match(result.text, /ship: 0/);
+  assert.match(result.text, /wait: 2/);
+  assert.match(result.text, /turnout: 2 of 2 members voted/);
 });
 
 test("end-to-end council flow over MCP", async () => {

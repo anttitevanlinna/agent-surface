@@ -298,5 +298,97 @@ export function createServer(store: Store): McpServer {
       }),
   );
 
+  server.registerTool(
+    "create_proposal",
+    {
+      title: "Create a proposal",
+      description:
+        "Open a proposal for the council to vote on. Returns a proposalId and broadcasts the proposal to the feed so members can vote on it with cast_vote. Members vote among the options you declare (plus 'abstain', always available).",
+      inputSchema: {
+        councilId: z.string().describe("The council id."),
+        session: z.string().describe("Your sessionId (from register_session)."),
+        text: z.string().describe("What the council is voting on."),
+        options: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "The choices voters may pick. Defaults to ['yes', 'no']. Must be at least two distinct values; 'abstain' is reserved.",
+          ),
+      },
+    },
+    async ({ councilId, session, text, options }) =>
+      guard("create_proposal", async () => {
+        const proposal = await store.createProposal({
+          councilId,
+          sessionId: session,
+          text,
+          options,
+        });
+        return ok(
+          [
+            `Proposal opened.`,
+            `proposalId: ${proposal.id}  (vote on it with cast_vote)`,
+            `text: ${proposal.text}`,
+            `options: ${proposal.options.join(" / ")} / abstain`,
+          ].join("\n"),
+        );
+      }),
+  );
+
+  server.registerTool(
+    "cast_vote",
+    {
+      title: "Cast a vote",
+      description:
+        "Vote on a proposal as your session. Your choice must be one of the proposal's options, or 'abstain'. Voting again replaces your previous vote.",
+      inputSchema: {
+        councilId: z.string().describe("The council id."),
+        session: z.string().describe("Your sessionId (from register_session)."),
+        proposalId: z.string().describe("The proposalId (from create_proposal)."),
+        choice: z
+          .string()
+          .describe("One of the proposal's options, or 'abstain'."),
+      },
+    },
+    async ({ councilId, session, proposalId, choice }) =>
+      guard("cast_vote", async () => {
+        const vote = await store.castVote({
+          councilId,
+          sessionId: session,
+          proposalId,
+          choice,
+        });
+        return ok(`Vote recorded: "${vote.choice}" on proposal ${vote.proposalId}.`);
+      }),
+  );
+
+  server.registerTool(
+    "tally",
+    {
+      title: "Tally a proposal",
+      description:
+        "Count the votes on a proposal: each option with its count, abstentions, and turnout against the council size.",
+      inputSchema: {
+        councilId: z.string().describe("The council id."),
+        proposalId: z.string().describe("The proposalId to count."),
+      },
+    },
+    async ({ councilId, proposalId }) =>
+      guard("tally", async () => {
+        const result = await store.tally(councilId, proposalId);
+        const lines = Object.entries(result.counts).map(
+          ([option, count]) => `  ${option}: ${count}`,
+        );
+        return ok(
+          [
+            `Tally — proposal ${result.proposalId}: "${result.text}"`,
+            ...lines,
+            `  abstain: ${result.abstain}`,
+            `turnout: ${result.voted} of ${result.members} members voted`,
+          ].join("\n"),
+        );
+      }),
+  );
+
   return server;
 }

@@ -60,6 +60,47 @@ export interface Message {
   createdAt: string; // ISO timestamp
 }
 
+/**
+ * A motion put to the council for a vote. Created by any member, it declares
+ * the choices voters may pick (plus the always-available "abstain"). Its `id`
+ * is what votes and tallies reference. Creating one also drops a broadcast
+ * message into the feed so other members can discover and vote on it.
+ */
+export interface Proposal {
+  id: string;
+  councilId: string;
+  text: string;
+  options: string[];
+  proposedBySessionId: string;
+  proposedByName: string;
+  createdAt: string; // ISO timestamp
+}
+
+/** One session's ballot on one proposal. Re-casting replaces the prior vote. */
+export interface Vote {
+  proposalId: string;
+  sessionId: string;
+  choice: string; // one of the proposal's options, or "abstain"
+  castAt: string; // ISO timestamp
+}
+
+/** The counted result of a proposal's votes. */
+export interface Tally {
+  proposalId: string;
+  text: string;
+  /** Each declared option mapped to its vote count (zeros included). */
+  counts: Record<string, number>;
+  abstain: number;
+  /** Distinct sessions that cast any ballot (including abstain). */
+  voted: number;
+  /** Current council size, for turnout. */
+  members: number;
+}
+
+/** The choice that always counts as present-but-undecided, reserved so it can't
+ * collide with a declared option. */
+export const ABSTAIN = "abstain";
+
 export interface RegisterSessionInput {
   name: string;
 }
@@ -85,6 +126,22 @@ export interface SendMessageInput {
   /** Specific recipient session id, or omitted/null for a broadcast. */
   toSessionId?: string | null;
   kind?: MessageKind;
+}
+
+export interface CreateProposalInput {
+  councilId: string;
+  sessionId: string;
+  text: string;
+  /** Choices voters may pick. Defaults to ["yes", "no"]. */
+  options?: string[];
+}
+
+export interface CastVoteInput {
+  councilId: string;
+  sessionId: string;
+  proposalId: string;
+  /** One of the proposal's options, or "abstain". */
+  choice: string;
 }
 
 export interface Store {
@@ -126,6 +183,25 @@ export interface Store {
     sessionId: string,
     sinceSeq?: number,
   ): Promise<Message[]>;
+
+  /**
+   * Open a proposal for a vote. The creator must be a member of the council.
+   * Also posts a broadcast `proposal` message carrying the new proposalId, so
+   * other members can discover and vote on it by polling.
+   */
+  createProposal(input: CreateProposalInput): Promise<Proposal>;
+
+  getProposal(proposalId: string): Promise<Proposal | undefined>;
+
+  /**
+   * Cast (or re-cast) a vote. The voter must be a member and the choice must be
+   * one of the proposal's options or "abstain". A session's later vote replaces
+   * its earlier one.
+   */
+  castVote(input: CastVoteInput): Promise<Vote>;
+
+  /** Count the votes on a proposal. */
+  tally(councilId: string, proposalId: string): Promise<Tally>;
 }
 
 /** Thrown when an input refers to a session/council that doesn't exist, or a
