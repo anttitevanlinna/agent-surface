@@ -3,37 +3,118 @@ import assert from "node:assert/strict";
 import { MemoryStore } from "../src/memoryStore.ts";
 import { CoordinationError } from "../src/store.ts";
 
+/** A council with a chair (Coordinator) and two members (Alice, Bob), each a
+ * registered session. Returns the store plus everyone's sessionId. */
 async function council() {
   const store = new MemoryStore();
-  const { council, chair } = await store.createCouncil({
+  const coordinator = await store.registerSession({ name: "Coordinator" });
+  const aliceSession = await store.registerSession({ name: "Alice" });
+  const bobSession = await store.registerSession({ name: "Bob" });
+
+  const { council } = await store.createCouncil({
     topic: "Ship or wait?",
-    chairName: "Coordinator",
+    sessionId: coordinator.id,
   });
-  const alice = await store.joinCouncil({
+  await store.joinCouncil({
     councilId: council.id,
-    name: "Alice",
+    sessionId: aliceSession.id,
     role: "Security",
   });
-  const bob = await store.joinCouncil({
+  await store.joinCouncil({
     councilId: council.id,
-    name: "Bob",
+    sessionId: bobSession.id,
     role: "Perf",
   });
-  return { store, councilId: council.id, chair, alice, bob };
+  return {
+    store,
+    councilId: council.id,
+    chair: coordinator,
+    alice: aliceSession,
+    bob: bobSession,
+  };
 }
+
+test("a session must be registered before it can chair a council", async () => {
+  const store = new MemoryStore();
+  await assert.rejects(
+    store.createCouncil({ topic: "x", sessionId: "never-registered" }),
+    CoordinationError,
+  );
+});
+
+test("a session must be registered before it can send messages", async () => {
+  const store = new MemoryStore();
+  const chair = await store.registerSession({ name: "Chair" });
+  const { council } = await store.createCouncil({
+    topic: "x",
+    sessionId: chair.id,
+  });
+  await assert.rejects(
+    store.sendMessage({
+      councilId: council.id,
+      fromSessionId: "never-registered",
+      content: "x",
+    }),
+    CoordinationError,
+  );
+});
+
+test("session names are unique server-wide", async () => {
+  const store = new MemoryStore();
+  await store.registerSession({ name: "Coordinator" });
+  await assert.rejects(
+    store.registerSession({ name: "Coordinator" }),
+    CoordinationError,
+  );
+});
+
+test("one session can join and message across several councils", async () => {
+  const store = new MemoryStore();
+  const chair = await store.registerSession({ name: "Chair" });
+  const roamer = await store.registerSession({ name: "Roamer" });
+
+  const a = await store.createCouncil({ topic: "A", sessionId: chair.id });
+  const b = await store.createCouncil({ topic: "B", sessionId: chair.id });
+  await store.joinCouncil({ councilId: a.council.id, sessionId: roamer.id });
+  await store.joinCouncil({ councilId: b.council.id, sessionId: roamer.id });
+
+  const inA = await store.sendMessage({
+    councilId: a.council.id,
+    fromSessionId: roamer.id,
+    content: "hello A",
+  });
+  const inB = await store.sendMessage({
+    councilId: b.council.id,
+    fromSessionId: roamer.id,
+    content: "hello B",
+  });
+  // Same session, but seq is per-council — both start at 1.
+  assert.equal(inA.seq, 1);
+  assert.equal(inB.seq, 1);
+  assert.equal((await store.getMessages(a.council.id, roamer.id)).length, 1);
+  assert.equal((await store.getMessages(b.council.id, roamer.id)).length, 1);
+});
+
+test("joining the same council twice with one session fails", async () => {
+  const { store, councilId, alice } = await council();
+  await assert.rejects(
+    store.joinCouncil({ councilId, sessionId: alice.id }),
+    CoordinationError,
+  );
+});
 
 test("broadcasts are visible to everyone", async () => {
   const { store, councilId, chair, alice, bob } = await council();
   await store.sendMessage({
     councilId,
-    fromAgentId: chair.id,
+    fromSessionId: chair.id,
     content: "Welcome all.",
   });
-  for (const agent of [chair, alice, bob]) {
-    const msgs = await store.getMessages(councilId, agent.id);
+  for (const session of [chair, alice, bob]) {
+    const msgs = await store.getMessages(councilId, session.id);
     assert.equal(msgs.length, 1);
     assert.equal(msgs[0].content, "Welcome all.");
-    assert.equal(msgs[0].toAgentId, null);
+    assert.equal(msgs[0].toSessionId, null);
   }
 });
 
@@ -41,9 +122,9 @@ test("direct messages reach only sender and recipient", async () => {
   const { store, councilId, chair, alice, bob } = await council();
   await store.sendMessage({
     councilId,
-    fromAgentId: alice.id,
+    fromSessionId: alice.id,
     content: "Just for the chair.",
-    toAgentId: chair.id,
+    toSessionId: chair.id,
   });
   assert.equal((await store.getMessages(councilId, chair.id)).length, 1);
   assert.equal((await store.getMessages(councilId, alice.id)).length, 1);
@@ -52,10 +133,14 @@ test("direct messages reach only sender and recipient", async () => {
 
 test("sinceSeq pages only newer messages", async () => {
   const { store, councilId, chair, alice } = await council();
-  await store.sendMessage({ councilId, fromAgentId: chair.id, content: "one" });
+  await store.sendMessage({
+    councilId,
+    fromSessionId: chair.id,
+    content: "one",
+  });
   const second = await store.sendMessage({
     councilId,
-    fromAgentId: chair.id,
+    fromSessionId: chair.id,
     content: "two",
   });
   const fresh = await store.getMessages(councilId, alice.id, 1);
@@ -66,8 +151,16 @@ test("sinceSeq pages only newer messages", async () => {
 
 test("seq is monotonic per council", async () => {
   const { store, councilId, chair } = await council();
-  const a = await store.sendMessage({ councilId, fromAgentId: chair.id, content: "a" });
-  const b = await store.sendMessage({ councilId, fromAgentId: chair.id, content: "b" });
+  const a = await store.sendMessage({
+    councilId,
+    fromSessionId: chair.id,
+    content: "a",
+  });
+  const b = await store.sendMessage({
+    councilId,
+    fromSessionId: chair.id,
+    content: "b",
+  });
   assert.equal(a.seq, 1);
   assert.equal(b.seq, 2);
 });
@@ -77,7 +170,7 @@ test("only the chair can post a decision", async () => {
   await assert.rejects(
     store.sendMessage({
       councilId,
-      fromAgentId: alice.id,
+      fromSessionId: alice.id,
       content: "We ship.",
       kind: "decision",
     }),
@@ -85,7 +178,7 @@ test("only the chair can post a decision", async () => {
   );
   const decision = await store.sendMessage({
     councilId,
-    fromAgentId: chair.id,
+    fromSessionId: chair.id,
     content: "We ship.",
     kind: "decision",
   });
@@ -96,7 +189,7 @@ test("non-decision kinds are open to all members", async () => {
   const { store, councilId, alice } = await council();
   const proposal = await store.sendMessage({
     councilId,
-    fromAgentId: alice.id,
+    fromSessionId: alice.id,
     content: "Propose we wait a week.",
     kind: "proposal",
   });
@@ -106,15 +199,24 @@ test("non-decision kinds are open to all members", async () => {
 test("sending into an unknown council fails", async () => {
   const { store, chair } = await council();
   await assert.rejects(
-    store.sendMessage({ councilId: "nope", fromAgentId: chair.id, content: "x" }),
+    store.sendMessage({
+      councilId: "nope",
+      fromSessionId: chair.id,
+      content: "x",
+    }),
     CoordinationError,
   );
 });
 
-test("a stranger cannot send to a council", async () => {
+test("a non-member session cannot send to a council", async () => {
   const { store, councilId } = await council();
+  const stranger = await store.registerSession({ name: "Stranger" });
   await assert.rejects(
-    store.sendMessage({ councilId, fromAgentId: "stranger", content: "x" }),
+    store.sendMessage({
+      councilId,
+      fromSessionId: stranger.id,
+      content: "x",
+    }),
     CoordinationError,
   );
 });
@@ -124,9 +226,9 @@ test("directing a message to a non-member fails", async () => {
   await assert.rejects(
     store.sendMessage({
       councilId,
-      fromAgentId: chair.id,
+      fromSessionId: chair.id,
       content: "x",
-      toAgentId: "ghost",
+      toSessionId: "ghost",
     }),
     CoordinationError,
   );

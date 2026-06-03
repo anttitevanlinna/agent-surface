@@ -5,6 +5,10 @@
  * stateless HTTP mode we build one of these per request, but they all point at
  * the same store — which is exactly how independent agents end up in the same
  * council.
+ *
+ * Identity is a *session*: register a name once, get a sessionId, and act as
+ * that session everywhere. Registration is a precondition — create_council,
+ * join_council, send_message and get_messages all reject an unknown session.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -16,9 +20,9 @@ const messageKind = z.enum(["message", "proposal", "vote", "decision"]);
 
 /** Render a message for an agent's eyes — compact, scannable. */
 function renderMessage(m: Message): string {
-  const to = m.toAgentId ? `→ ${m.toAgentId}` : "→ all";
+  const to = m.toSessionId ? `→ ${m.toSessionId}` : "→ all";
   const tag = m.kind === "message" ? "" : ` [${m.kind.toUpperCase()}]`;
-  return `#${m.seq} ${m.fromName} (${m.fromAgentId}) ${to}${tag}: ${m.content}`;
+  return `#${m.seq} ${m.fromName} (${m.fromSessionId}) ${to}${tag}: ${m.content}`;
 }
 
 function ok(text: string) {
@@ -66,34 +70,63 @@ export function createServer(store: Store): McpServer {
   });
 
   server.registerTool(
+    "register_session",
+    {
+      title: "Register a session",
+      description:
+        "Register a named session — your identity on this server. Returns a sessionId you must hold and pass on every later call. You must register before you can create or join a council, or send or read messages. Names are unique server-wide.",
+      inputSchema: {
+        name: z
+          .string()
+          .describe(
+            "A unique display name for this session (e.g. 'Coordinator').",
+          ),
+      },
+    },
+    async ({ name }) =>
+      guard("register_session", async () => {
+        const session = await store.registerSession({ name });
+        return ok(
+          [
+            `Session registered.`,
+            `sessionId: ${session.id}  (hold this — pass it on every call)`,
+            `name: ${session.name}`,
+          ].join("\n"),
+        );
+      }),
+  );
+
+  server.registerTool(
     "create_council",
     {
       title: "Create a council",
       description:
-        "Open a new coordination space (a 'council') on a topic and register yourself as the chair. Returns the councilId to share with other agents, plus your own agentId. Use the agentId on every later call.",
+        "Open a new coordination space (a 'council') on a topic and register your session as the chair. Returns the councilId to share with other agents. Pass your sessionId (from register_session).",
       inputSchema: {
         topic: z.string().describe("What this council is convened to decide."),
-        chairName: z
+        session: z
           .string()
-          .describe("Display name for you, the chair (e.g. 'Coordinator')."),
+          .describe(
+            "Your sessionId (from register_session). You become the chair.",
+          ),
         chairRole: z
           .string()
           .optional()
           .describe("Optional role label for the chair. Defaults to 'Chair'."),
       },
     },
-    async ({ topic, chairName, chairRole }) =>
+    async ({ topic, session, chairRole }) =>
       guard("create_council", async () => {
         const { council, chair } = await store.createCouncil({
           topic,
-          chairName,
+          sessionId: session,
           chairRole,
         });
         return ok(
           [
             `Council created.`,
             `councilId: ${council.id}  (share this with other agents)`,
-            `your agentId: ${chair.id}  (you are the chair — use this id on every call)`,
+            `chair: ${chair.name} (${chair.sessionId}) — you chair this council`,
             `topic: ${council.topic}`,
           ].join("\n"),
         );
@@ -105,10 +138,10 @@ export function createServer(store: Store): McpServer {
     {
       title: "Join a council",
       description:
-        "Join an existing council by id, registering yourself as a participant. Returns your agentId, which you must pass on every later call.",
+        "Join an existing council by id, registering your session as a participant. Pass your sessionId (from register_session).",
       inputSchema: {
         councilId: z.string().describe("The council id to join."),
-        name: z.string().describe("Your display name in this council."),
+        session: z.string().describe("Your sessionId (from register_session)."),
         role: z
           .string()
           .optional()
@@ -117,20 +150,23 @@ export function createServer(store: Store): McpServer {
           ),
       },
     },
-    async ({ councilId, name, role }) =>
+    async ({ councilId, session, role }) =>
       guard("join_council", async () => {
-        const agent = await store.joinCouncil({ councilId, name, role });
+        const membership = await store.joinCouncil({
+          councilId,
+          sessionId: session,
+          role,
+        });
         const council = await store.getCouncil(councilId);
         const participants = await store.listParticipants(councilId);
         return ok(
           [
-            `Joined council ${councilId}.`,
-            `your agentId: ${agent.id}  (use this id on every call)`,
+            `Joined council ${councilId} as ${membership.name}.`,
             `topic: ${council?.topic ?? "(unknown)"}`,
             `participants (${participants.length}):`,
             ...participants.map(
               (p) =>
-                `  - ${p.name} (${p.id}) — ${p.role}${p.isChair ? " [chair]" : ""}`,
+                `  - ${p.name} (${p.sessionId}) — ${p.role}${p.isChair ? " [chair]" : ""}`,
             ),
           ].join("\n"),
         );
@@ -179,7 +215,7 @@ export function createServer(store: Store): McpServer {
             `participants (${participants.length}):`,
             ...participants.map(
               (p) =>
-                `  - ${p.name} (${p.id}) — ${p.role}${p.isChair ? " [chair]" : ""}`,
+                `  - ${p.name} (${p.sessionId}) — ${p.role}${p.isChair ? " [chair]" : ""}`,
             ),
           ].join("\n"),
         );
@@ -191,18 +227,16 @@ export function createServer(store: Store): McpServer {
     {
       title: "Send a message",
       description:
-        "Post a message to the council. Omit `to` to broadcast to everyone, or set it to a participant's agentId for a direct message. Use `kind` to mark proposals, votes, or — chair only — a binding decision.",
+        "Post a message to the council as your session. Omit `to` to broadcast to everyone, or set it to a participant's sessionId for a direct message. Use `kind` to mark proposals, votes, or — chair only — a binding decision.",
       inputSchema: {
         councilId: z.string().describe("The council id."),
-        fromAgentId: z
-          .string()
-          .describe("Your agentId (from create_council or join_council)."),
+        session: z.string().describe("Your sessionId (from register_session)."),
         content: z.string().describe("The message body."),
         to: z
           .string()
           .optional()
           .describe(
-            "Recipient agentId for a direct message. Omit to broadcast to the whole council.",
+            "Recipient sessionId for a direct message. Omit to broadcast to the whole council.",
           ),
         kind: messageKind
           .optional()
@@ -211,18 +245,18 @@ export function createServer(store: Store): McpServer {
           ),
       },
     },
-    async ({ councilId, fromAgentId, content, to, kind }) =>
+    async ({ councilId, session, content, to, kind }) =>
       guard("send_message", async () => {
         const message = await store.sendMessage({
           councilId,
-          fromAgentId,
+          fromSessionId: session,
           content,
-          toAgentId: to ?? null,
+          toSessionId: to ?? null,
           kind,
         });
         return ok(
           `Sent #${message.seq} (id ${message.id}, kind ${message.kind}, ${
-            message.toAgentId ? `to ${message.toAgentId}` : "broadcast"
+            message.toSessionId ? `to ${message.toSessionId}` : "broadcast"
           }).`,
         );
       }),
@@ -233,10 +267,10 @@ export function createServer(store: Store): McpServer {
     {
       title: "Get messages",
       description:
-        "Read messages addressed to you (broadcasts + direct messages to you + your own), in order. Pass `sinceSeq` with the last seq you've seen to poll for only new messages. Returns the latest seq so you can poll again.",
+        "Read messages addressed to your session (broadcasts + direct messages to you + your own), in order. Pass `sinceSeq` with the last seq you've seen to poll for only new messages. Returns the latest seq so you can poll again.",
       inputSchema: {
         councilId: z.string().describe("The council id."),
-        agentId: z.string().describe("Your agentId."),
+        session: z.string().describe("Your sessionId (from register_session)."),
         sinceSeq: z
           .number()
           .int()
@@ -247,9 +281,9 @@ export function createServer(store: Store): McpServer {
           ),
       },
     },
-    async ({ councilId, agentId, sinceSeq }) =>
+    async ({ councilId, session, sinceSeq }) =>
       guard("get_messages", async () => {
-        const messages = await store.getMessages(councilId, agentId, sinceSeq);
+        const messages = await store.getMessages(councilId, session, sinceSeq);
         if (messages.length === 0) {
           return ok(`No new messages (sinceSeq ${sinceSeq ?? 0}).`);
         }

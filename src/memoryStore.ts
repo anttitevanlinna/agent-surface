@@ -9,13 +9,15 @@
 
 import { randomUUID } from "node:crypto";
 import {
-  type Agent,
   type Council,
   CoordinationError,
   type CreateCouncilInput,
   type JoinCouncilInput,
+  type Membership,
   type Message,
+  type RegisterSessionInput,
   type SendMessageInput,
+  type Session,
   type Store,
 } from "./store.js";
 
@@ -28,36 +30,72 @@ function now(): string {
   return new Date().toISOString();
 }
 
+/** Composite key for a session's membership in a council. */
+function memberKey(councilId: string, sessionId: string): string {
+  return `${councilId}:${sessionId}`;
+}
+
 export class MemoryStore implements Store {
+  private sessions = new Map<string, Session>();
+  private sessionIdByName = new Map<string, string>(); // name -> sessionId (uniqueness)
   private councils = new Map<string, Council>();
-  private agents = new Map<string, Agent>();
+  private memberships = new Map<string, Membership>(); // `${councilId}:${sessionId}`
   private messages = new Map<string, Message[]>(); // councilId -> ordered messages
   private seqByCouncil = new Map<string, number>(); // councilId -> last seq used
 
+  async registerSession(input: RegisterSessionInput): Promise<Session> {
+    const name = input.name.trim();
+    if (name.length === 0) {
+      throw new CoordinationError("A session name must not be empty.");
+    }
+    if (this.sessionIdByName.has(name)) {
+      throw new CoordinationError(
+        `The session name "${name}" is already registered.`,
+      );
+    }
+    const session: Session = {
+      id: shortId(),
+      name,
+      registeredAt: now(),
+    };
+    this.sessions.set(session.id, session);
+    this.sessionIdByName.set(name, session.id);
+    return session;
+  }
+
+  async getSession(sessionId: string): Promise<Session | undefined> {
+    return this.sessions.get(sessionId);
+  }
+
   async createCouncil(
     input: CreateCouncilInput,
-  ): Promise<{ council: Council; chair: Agent }> {
+  ): Promise<{ council: Council; chair: Membership }> {
+    const session = this.sessions.get(input.sessionId);
+    if (!session) {
+      throw new CoordinationError(
+        `No session with id "${input.sessionId}". Register a session first.`,
+      );
+    }
     const councilId = shortId();
-    const chairId = shortId();
     const timestamp = now();
 
-    const chair: Agent = {
-      id: chairId,
+    const council: Council = {
+      id: councilId,
+      topic: input.topic,
+      chairSessionId: session.id,
+      createdAt: timestamp,
+    };
+    const chair: Membership = {
       councilId,
-      name: input.chairName,
+      sessionId: session.id,
+      name: session.name,
       role: input.chairRole ?? "Chair",
       isChair: true,
       joinedAt: timestamp,
     };
-    const council: Council = {
-      id: councilId,
-      topic: input.topic,
-      chairAgentId: chairId,
-      createdAt: timestamp,
-    };
 
     this.councils.set(councilId, council);
-    this.agents.set(chairId, chair);
+    this.memberships.set(memberKey(councilId, session.id), chair);
     this.messages.set(councilId, []);
     this.seqByCouncil.set(councilId, 0);
 
@@ -74,30 +112,45 @@ export class MemoryStore implements Store {
     );
   }
 
-  async joinCouncil(input: JoinCouncilInput): Promise<Agent> {
+  async joinCouncil(input: JoinCouncilInput): Promise<Membership> {
     const council = this.councils.get(input.councilId);
     if (!council) {
       throw new CoordinationError(`No council with id "${input.councilId}".`);
     }
-    const agent: Agent = {
-      id: shortId(),
+    const session = this.sessions.get(input.sessionId);
+    if (!session) {
+      throw new CoordinationError(
+        `No session with id "${input.sessionId}". Register a session first.`,
+      );
+    }
+    const key = memberKey(input.councilId, session.id);
+    if (this.memberships.has(key)) {
+      throw new CoordinationError(
+        `Session "${session.name}" is already a member of council "${input.councilId}".`,
+      );
+    }
+    const membership: Membership = {
       councilId: input.councilId,
-      name: input.name,
+      sessionId: session.id,
+      name: session.name,
       role: input.role ?? "Member",
       isChair: false,
       joinedAt: now(),
     };
-    this.agents.set(agent.id, agent);
-    return agent;
+    this.memberships.set(key, membership);
+    return membership;
   }
 
-  async getAgent(agentId: string): Promise<Agent | undefined> {
-    return this.agents.get(agentId);
+  async getMembership(
+    councilId: string,
+    sessionId: string,
+  ): Promise<Membership | undefined> {
+    return this.memberships.get(memberKey(councilId, sessionId));
   }
 
-  async listParticipants(councilId: string): Promise<Agent[]> {
-    return [...this.agents.values()]
-      .filter((a) => a.councilId === councilId)
+  async listParticipants(councilId: string): Promise<Membership[]> {
+    return [...this.memberships.values()]
+      .filter((m) => m.councilId === councilId)
       .sort((a, b) => (a.joinedAt < b.joinedAt ? -1 : 1));
   }
 
@@ -106,19 +159,23 @@ export class MemoryStore implements Store {
     if (!council) {
       throw new CoordinationError(`No council with id "${input.councilId}".`);
     }
-    const sender = this.agents.get(input.fromAgentId);
-    if (!sender || sender.councilId !== input.councilId) {
+    const sender = this.memberships.get(
+      memberKey(input.councilId, input.fromSessionId),
+    );
+    if (!sender) {
       throw new CoordinationError(
-        `Agent "${input.fromAgentId}" is not a member of council "${input.councilId}".`,
+        `Session "${input.fromSessionId}" is not a member of council "${input.councilId}".`,
       );
     }
 
-    const toAgentId = input.toAgentId ?? null;
-    if (toAgentId !== null) {
-      const recipient = this.agents.get(toAgentId);
-      if (!recipient || recipient.councilId !== input.councilId) {
+    const toSessionId = input.toSessionId ?? null;
+    if (toSessionId !== null) {
+      const recipient = this.memberships.get(
+        memberKey(input.councilId, toSessionId),
+      );
+      if (!recipient) {
         throw new CoordinationError(
-          `Recipient "${toAgentId}" is not a member of council "${input.councilId}".`,
+          `Recipient "${toSessionId}" is not a member of council "${input.councilId}".`,
         );
       }
     }
@@ -138,9 +195,9 @@ export class MemoryStore implements Store {
       id: shortId(),
       councilId: input.councilId,
       seq,
-      fromAgentId: sender.id,
+      fromSessionId: sender.sessionId,
       fromName: sender.name,
-      toAgentId,
+      toSessionId,
       kind,
       content: input.content,
       createdAt: now(),
@@ -151,17 +208,17 @@ export class MemoryStore implements Store {
 
   async getMessages(
     councilId: string,
-    agentId: string,
+    sessionId: string,
     sinceSeq = 0,
   ): Promise<Message[]> {
     const council = this.councils.get(councilId);
     if (!council) {
       throw new CoordinationError(`No council with id "${councilId}".`);
     }
-    const agent = this.agents.get(agentId);
-    if (!agent || agent.councilId !== councilId) {
+    const member = this.memberships.get(memberKey(councilId, sessionId));
+    if (!member) {
       throw new CoordinationError(
-        `Agent "${agentId}" is not a member of council "${councilId}".`,
+        `Session "${sessionId}" is not a member of council "${councilId}".`,
       );
     }
 
@@ -169,9 +226,9 @@ export class MemoryStore implements Store {
     return all.filter(
       (m) =>
         m.seq > sinceSeq &&
-        (m.toAgentId === null ||
-          m.toAgentId === agentId ||
-          m.fromAgentId === agentId),
+        (m.toSessionId === null ||
+          m.toSessionId === sessionId ||
+          m.fromSessionId === sessionId),
     );
   }
 }

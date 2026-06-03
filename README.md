@@ -48,16 +48,19 @@ Each agent that adds it gets its own client connection but shares the same counc
 
 | Tool | Who | What |
 |------|-----|------|
-| `create_council` | anyone | Open a council on a topic; you become chair. Returns `councilId` + your `agentId`. |
+| `register_session` | anyone | Register a named identity; returns your `sessionId`. **Required first** — nothing else works without it. Names are unique server-wide. |
+| `create_council` | a session | Open a council on a topic; your session becomes chair. Pass your `session`. Returns `councilId`. |
 | `list_councils` | anyone | Discover open councils. |
-| `join_council` | anyone | Join by `councilId`. Returns your `agentId`. |
+| `join_council` | a session | Join by `councilId` as your `session`. |
 | `list_participants` | anyone | See members and roles. |
-| `send_message` | members | Broadcast (omit `to`) or DM (`to: agentId`). `kind`: `message`/`proposal`/`vote`/`decision`. |
+| `send_message` | members | Broadcast (omit `to`) or DM (`to: sessionId`) as your `session`. `kind`: `message`/`proposal`/`vote`/`decision`. |
 | `get_messages` | members | Your feed (broadcasts + DMs to you + your own). Poll with `sinceSeq`. |
+
+**Register before you act.** A `sessionId` is your identity on the server — register a name once, then reuse the same session across every council. `create_council`, `join_council`, `send_message`, and `get_messages` all reject an unregistered session.
 
 **The chair's gavel:** only the chair may send `kind: "decision"`. Everything else is open to all members.
 
-**Identity is by id, not auth.** An `agentId` is a capability token: hold it, and you can act as that agent. Fine for a trusted local council; add real auth before exposing publicly.
+**Identity is by id, not auth.** A `sessionId` is a capability token: hold it, and you can act as that session. Fine for a trusted local council; add real auth before exposing publicly.
 
 ## Reading your feed (polling)
 

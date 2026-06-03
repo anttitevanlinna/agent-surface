@@ -39,14 +39,20 @@ async function callText(
   return { text: res.content[0].text, isError: res.isError ?? false };
 }
 
-/** Pull "councilId: xxxx" / "your agentId: xxxx" out of a response. */
+/** Pull "sessionId: xxxx" / "councilId: xxxx" out of a response. */
 function field(text: string, label: string): string {
   const m = text.match(new RegExp(`${label}:\\s*(\\S+)`));
   assert.ok(m, `expected "${label}" in:\n${text}`);
   return m![1];
 }
 
-test("tools/list exposes all six tools", async () => {
+/** Register a session and return its id. */
+async function register(client: Client, name: string): Promise<string> {
+  const res = await callText(client, "register_session", { name });
+  return field(res.text, "sessionId");
+}
+
+test("tools/list exposes all seven tools", async () => {
   const client = await connect(new MemoryStore());
   const { tools } = await client.listTools();
   assert.deepEqual(
@@ -57,6 +63,7 @@ test("tools/list exposes all six tools", async () => {
       "join_council",
       "list_councils",
       "list_participants",
+      "register_session",
       "send_message",
     ],
   );
@@ -67,58 +74,90 @@ test("end-to-end council flow over MCP", async () => {
   const chair = await connect(store);
   const expert = await connect(store); // separate client, shared store
 
+  const chairSession = await register(chair, "Chair");
+  const aliceSession = await register(expert, "Alice");
+
   const created = await callText(chair, "create_council", {
     topic: "Ship v2 today?",
-    chairName: "Chair",
+    session: chairSession,
   });
   const councilId = field(created.text, "councilId");
-  const chairId = field(created.text, "your agentId");
 
-  const joined = await callText(expert, "join_council", {
+  await callText(expert, "join_council", {
     councilId,
-    name: "Alice",
+    session: aliceSession,
     role: "Security",
   });
-  const aliceId = field(joined.text, "your agentId");
 
   await callText(chair, "send_message", {
     councilId,
-    fromAgentId: chairId,
+    session: chairSession,
     content: "Weigh in.",
   });
   await callText(expert, "send_message", {
     councilId,
-    fromAgentId: aliceId,
+    session: aliceSession,
     content: "Unpatched CVE — wait.",
     kind: "proposal",
   });
 
   const feed = await callText(expert, "get_messages", {
     councilId,
-    agentId: aliceId,
+    session: aliceSession,
   });
   assert.match(feed.text, /Weigh in\./);
   assert.match(feed.text, /\[PROPOSAL\]/);
   assert.match(feed.text, /latest seq: 2/);
 });
 
+test("registering a session is a precondition for sending", async () => {
+  const store = new MemoryStore();
+  const chair = await connect(store);
+  const chairSession = await register(chair, "Chair");
+  const created = await callText(chair, "create_council", {
+    topic: "x",
+    session: chairSession,
+  });
+  const councilId = field(created.text, "councilId");
+
+  // An unregistered session id can't send.
+  const res = await callText(chair, "send_message", {
+    councilId,
+    session: "never-registered",
+    content: "hi",
+  });
+  assert.equal(res.isError, true);
+  assert.match(res.text, /No session|not a member/);
+});
+
+test("a duplicate session name is rejected as a tool error", async () => {
+  const client = await connect(new MemoryStore());
+  await callText(client, "register_session", { name: "Coordinator" });
+  const dup = await callText(client, "register_session", {
+    name: "Coordinator",
+  });
+  assert.equal(dup.isError, true);
+  assert.match(dup.text, /already registered/);
+});
+
 test("non-chair decision is rejected as a tool error", async () => {
   const store = new MemoryStore();
   const client = await connect(store);
+  const chairSession = await register(client, "Chair");
+  const aliceSession = await register(client, "Alice");
   const created = await callText(client, "create_council", {
     topic: "x",
-    chairName: "Chair",
+    session: chairSession,
   });
   const councilId = field(created.text, "councilId");
-  const joined = await callText(client, "join_council", {
+  await callText(client, "join_council", {
     councilId,
-    name: "Alice",
+    session: aliceSession,
   });
-  const aliceId = field(joined.text, "your agentId");
 
   const res = await callText(client, "send_message", {
     councilId,
-    fromAgentId: aliceId,
+    session: aliceSession,
     content: "We ship.",
     kind: "decision",
   });
