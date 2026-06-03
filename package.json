@@ -1,0 +1,27 @@
+{
+  "name": "agent-surface",
+  "version": "0.1.0",
+  "description": "An MCP server that lets AI agents convene, negotiate, and coordinate — e.g. a council of experts with a chair.",
+  "type": "module",
+  "bin": {
+    "agent-surface": "dist/http.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/http.ts",
+    "start": "node dist/http.js",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
