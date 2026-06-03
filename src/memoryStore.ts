@@ -42,18 +42,43 @@ function memberKey(councilId: string, sessionId: string): string {
   return `${councilId}:${sessionId}`;
 }
 
-/** Trim, drop blanks, de-duplicate, and validate a proposal's options. */
+/**
+ * An option's canonical identity: trimmed and case-folded. This is the single
+ * definition of "are these the same option?" — used both when declaring options
+ * (to reject collisions and the reserved abstain) and when matching a ballot to
+ * a declared option. Define it once here so those sites can never disagree.
+ */
+function optionKey(s: string): string {
+  return s.trim().toLowerCase();
+}
+
+/** Trim, drop blanks, de-duplicate by identity, and validate a proposal's
+ * options. Two options sharing a canonical identity (e.g. "Ship"/"ship") are a
+ * collision and rejected, not silently merged — the proposer should disambiguate. */
 function normalizeOptions(raw?: string[]): string[] {
   const provided = (raw ?? ["yes", "no"])
     .map((o) => o.trim())
     .filter((o) => o.length > 0);
-  const unique = [...new Set(provided)];
+
+  const byKey = new Map<string, string>();
+  for (const option of provided) {
+    const key = optionKey(option);
+    const existing = byKey.get(key);
+    if (existing !== undefined) {
+      throw new CoordinationError(
+        `Options "${existing}" and "${option}" are the same choice — option names must be distinct ignoring case.`,
+      );
+    }
+    byKey.set(key, option);
+  }
+
+  const unique = [...byKey.values()];
   if (unique.length < 2) {
     throw new CoordinationError(
       "A proposal needs at least two distinct options.",
     );
   }
-  if (unique.some((o) => o.toLowerCase() === ABSTAIN)) {
+  if (unique.some((o) => optionKey(o) === ABSTAIN)) {
     throw new CoordinationError(
       `"${ABSTAIN}" is reserved and always available — don't list it as an option.`,
     );
@@ -312,11 +337,19 @@ export class MemoryStore implements Store {
         `No proposal "${input.proposalId}" in council "${input.councilId}".`,
       );
     }
-    const choice = input.choice.trim();
-    const isAbstain = choice.toLowerCase() === ABSTAIN;
-    if (!isAbstain && !proposal.options.includes(choice)) {
+    // Match the ballot to a declared option by canonical identity, then store
+    // the option's own casing. Voting "ship" for a "Ship" option must count,
+    // and the stored choice must equal the declared option so tally() (keyed on
+    // the declared options) finds it. Same optionKey() used to declare options,
+    // so matching and declaration can't drift apart.
+    const key = optionKey(input.choice);
+    const matched =
+      key === ABSTAIN
+        ? ABSTAIN
+        : proposal.options.find((o) => optionKey(o) === key);
+    if (matched === undefined) {
       throw new CoordinationError(
-        `"${choice}" is not a valid choice. Pick one of: ${proposal.options.join(
+        `"${input.choice.trim()}" is not a valid choice. Pick one of: ${proposal.options.join(
           ", ",
         )}, or ${ABSTAIN}.`,
       );
@@ -325,7 +358,7 @@ export class MemoryStore implements Store {
     const vote: Vote = {
       proposalId: proposal.id,
       sessionId: voter.sessionId,
-      choice: isAbstain ? ABSTAIN : choice,
+      choice: matched,
       castAt: now(),
     };
     // Last vote wins: one ballot per session per proposal.

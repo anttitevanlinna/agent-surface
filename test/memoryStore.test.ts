@@ -245,6 +245,64 @@ test("listParticipants returns members in join order with chair flagged", async 
   assert.equal(members[1].isChair, false);
 });
 
+test("voting an option is case-insensitive and counts under the declared option", async () => {
+  const { store, councilId, chair, alice } = await council();
+  const proposal = await store.createProposal({
+    councilId,
+    sessionId: chair.id,
+    text: "Ship v2 today?",
+    options: ["Ship", "Wait"],
+  });
+  // Member votes with different casing than declared.
+  const vote = await store.castVote({
+    councilId,
+    sessionId: alice.id,
+    proposalId: proposal.id,
+    choice: "ship",
+  });
+  // The vote is canonicalized to the declared option's casing...
+  assert.equal(vote.choice, "Ship");
+  // ...so the tally counts it under "Ship", not loses it.
+  const result = await store.tally(councilId, proposal.id);
+  assert.equal(result.counts["Ship"], 1);
+  assert.equal(result.voted, 1);
+});
+
+test("declaring two options that differ only by case is refused as a collision", async () => {
+  // The root issue: option identity must be defined once. If a vote for "ship"
+  // matches a declared "Ship", then "Ship" and "ship" are the SAME option — so
+  // declaring both is a collision and must be refused, not silently kept.
+  const { store, councilId, chair } = await council();
+  await assert.rejects(
+    store.createProposal({
+      councilId,
+      sessionId: chair.id,
+      text: "Ship v2?",
+      options: ["Ship", "ship"],
+    }),
+    CoordinationError,
+  );
+});
+
+test("an option that doesn't match any declared option is still rejected", async () => {
+  const { store, councilId, chair, alice } = await council();
+  const proposal = await store.createProposal({
+    councilId,
+    sessionId: chair.id,
+    text: "Ship v2 today?",
+    options: ["Ship", "Wait"],
+  });
+  await assert.rejects(
+    store.castVote({
+      councilId,
+      sessionId: alice.id,
+      proposalId: proposal.id,
+      choice: "maybe",
+    }),
+    CoordinationError,
+  );
+});
+
 test("votes are counted, including zeros and abstentions, with turnout", async () => {
   const { store, councilId, chair, alice, bob } = await council();
   const proposal = await store.createProposal({
