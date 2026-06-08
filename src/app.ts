@@ -16,18 +16,34 @@
 
 import express, { type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { requireBearer } from "./auth.js";
 import { log } from "./logger.js";
 import { createServer } from "./server.js";
 import type { Store } from "./store.js";
 
-export function createApp(store: Store) {
+export interface CreateAppOptions {
+  /**
+   * Shared-secret perimeter token. When set, every /mcp route (POST and the
+   * 405 GET/DELETE) requires `Authorization: Bearer <token>`. When omitted,
+   * /mcp is OPEN — the entrypoint decides whether that is allowed (it is not on
+   * a hosted runtime; see http.ts fail-closed boot). /health is never gated.
+   */
+  authToken?: string;
+}
+
+export function createApp(store: Store, opts: CreateAppOptions = {}) {
   const app = express();
+
+  // Perimeter gate, mounted BEFORE the body parser so an unauthenticated
+  // oversized body never reaches the parser. Empty when no token is configured
+  // (open mode). Spreads cleanly into each route's middleware chain.
+  const gate = opts.authToken ? [requireBearer(opts.authToken)] : [];
 
   app.get("/health", (_req: Request, res: Response) => {
     res.json({ ok: true, server: "agent-surface", version: "0.1.0" });
   });
 
-  app.post("/mcp", express.json(), async (req: Request, res: Response) => {
+  app.post("/mcp", ...gate, express.json(), async (req: Request, res: Response) => {
     const rpcMethod = req.body?.method ?? "(unknown)";
     log.debug("mcp request", { method: rpcMethod });
     // Fresh, stateless transport + server per request; both close when done.
@@ -66,8 +82,8 @@ export function createApp(store: Store) {
       id: null,
     });
   };
-  app.get("/mcp", methodNotAllowed);
-  app.delete("/mcp", methodNotAllowed);
+  app.get("/mcp", ...gate, methodNotAllowed);
+  app.delete("/mcp", ...gate, methodNotAllowed);
 
   return app;
 }
