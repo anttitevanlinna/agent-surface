@@ -15,6 +15,7 @@
  * shapes) lives in app.ts so it stays testable without a live socket.
  */
 
+import type { AddressInfo } from "node:net";
 import { createApp } from "./app.js";
 import { log } from "./logger.js";
 import { MemoryStore } from "./memoryStore.js";
@@ -49,6 +50,29 @@ if (!authToken) {
 const app = createApp(store, { authToken });
 
 const PORT = Number(process.env.PORT ?? 3000);
-app.listen(PORT, () => {
-  log.info("agent-surface listening", { url: `http://localhost:${PORT}/mcp` });
+const server = app.listen(PORT, () => {
+  // Honest log: report the port actually bound (PORT=0 picks an ephemeral one)
+  // and the real auth posture, so the boot line never claims more than is true.
+  const bound = server.address() as AddressInfo | string | null;
+  const actualPort = typeof bound === "object" && bound ? bound.port : PORT;
+  log.info("agent-surface listening", {
+    url: `http://localhost:${actualPort}/mcp`,
+    auth: authToken ? "perimeter-gated" : "OPEN",
+  });
 });
+
+// Graceful shutdown: stop accepting new connections, let in-flight requests
+// drain, then exit. A hosted runtime sends SIGTERM on deploy/scale-down; SIGINT
+// is Ctrl-C in dev. Without this the process is killed mid-request.
+function shutdown(signal: string) {
+  log.info("shutting down", { signal });
+  server.close((err) => {
+    if (err) {
+      log.error("error during shutdown", { error: err.message });
+      process.exit(1);
+    }
+    process.exit(0);
+  });
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
