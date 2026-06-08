@@ -14,7 +14,11 @@
  * our tests, expect.
  */
 
-import express, { type Request, type Response } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { requireBearer } from "./auth.js";
 import { log } from "./logger.js";
@@ -43,7 +47,10 @@ export function createApp(store: Store, opts: CreateAppOptions = {}) {
     res.json({ ok: true, server: "agent-surface", version: "0.1.0" });
   });
 
-  app.post("/mcp", ...gate, express.json(), async (req: Request, res: Response) => {
+  // Body cap mounted AFTER the gate (above): an unauthenticated oversized body
+  // is rejected at the gate and never reaches this parser. 256kb is generous for
+  // a JSON-RPC coordination call yet bounds a trivial memory-exhaustion vector.
+  app.post("/mcp", ...gate, express.json({ limit: "256kb" }), async (req: Request, res: Response) => {
     const rpcMethod = req.body?.method ?? "(unknown)";
     log.debug("mcp request", { method: rpcMethod });
     // Fresh, stateless transport + server per request; both close when done.
@@ -84,6 +91,42 @@ export function createApp(store: Store, opts: CreateAppOptions = {}) {
   };
   app.get("/mcp", ...gate, methodNotAllowed);
   app.delete("/mcp", ...gate, methodNotAllowed);
+
+  // Terminal JSON-RPC error handler. express.json() throws a 413 for an
+  // over-limit body and a 400 for malformed JSON; by default finalhandler would
+  // answer those as HTML. Reshape them into the SAME JSON-RPC envelope as the
+  // 401/405 so every rejection a client meets is one parseable shape, never HTML.
+  app.use(
+    (err: unknown, _req: Request, res: Response, next: NextFunction): void => {
+      if (res.headersSent) return next(err);
+      const e = err as { type?: string; status?: number; statusCode?: number };
+      const status = e?.status ?? e?.statusCode;
+      if (e?.type === "entity.too.large" || status === 413) {
+        res.status(413).json({
+          jsonrpc: "2.0",
+          error: { code: -32600, message: "Request body exceeds 256kb limit." },
+          id: null,
+        });
+        return;
+      }
+      if (e?.type === "entity.parse.failed" || status === 400) {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32700, message: "Parse error: invalid JSON body." },
+          id: null,
+        });
+        return;
+      }
+      log.error("unhandled app error", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error." },
+        id: null,
+      });
+    },
+  );
 
   return app;
 }
