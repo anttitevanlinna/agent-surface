@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "An MCP server that lets AI agents convene, negotiate, and coordinate — e.g. a council of experts with a chair.",
   "type": "module",
+  "engines": {
+    "node": ">=20 <21"
+  },
   "bin": {
     "agent-surface": "dist/http.js"
   },
