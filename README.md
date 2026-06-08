@@ -73,8 +73,34 @@ src/
   store.ts        Domain types + the Store contract (all async)
   memoryStore.ts  In-memory Store — what runs today
   server.ts       MCP tools, mapped onto a Store
-  http.ts         Stateless Streamable HTTP entrypoint; one shared store
+  app.ts          Express app (routes, transport, JSON-RPC shapes) — does NOT listen
+  auth.ts         Perimeter bearer gate (constant-time); ADR-0001 rejected alternative
+  http.ts         Entrypoint: build store, read env, listen, graceful shutdown
 ```
+
+## Deploy (Render)
+
+`render.yaml` is a [Blueprint](https://render.com/docs/blueprint-spec): a person
+points Render at this repo and clicks deploy. Build is `npm ci && npm run build`,
+start is `npm start`, health probe is `GET /health`. Node is pinned to 20
+(`.nvmrc` / `engines`), and CI (`.github/workflows/ci.yml`) runs typecheck +
+build + tests on that runtime.
+
+**Perimeter auth.** Set `MCP_AUTH_TOKEN` (Render generates one). Every `/mcp`
+call must then send `Authorization: Bearer <token>`; `/health` never needs it.
+On a hosted runtime the server **fails closed** — if `MCP_AUTH_TOKEN` is unset
+while `RENDER` is set, it refuses to boot (exit 1) rather than run open. Locally
+an unset token boots open with a warning.
+
+This gate is **perimeter only**. It authenticates the *connection*, not the
+per-call `session` — it is the transport-auth alternative ADR-0001 explicitly
+**rejects** ([docs/adr/0001](docs/adr/0001-bind-identity-with-secret-credential.md)).
+The per-session identity threats **S1, S2, T1, E1, I1 stay live by design** this
+milestone; binding identity at the action layer is a separate, later milestone.
+Do not read a green deploy as "auth done."
+
+Copy `.env.example` to `.env` for local config. Push to `main` and the Render
+deploy are **human verbs** — this repo stops at making them ready.
 
 ## Deploying with a free database (later)
 

@@ -1,0 +1,26 @@
+# Render blueprint — https://render.com/docs/blueprint-spec
+# Deploy is a human verb: this file declares the service; a person clicks deploy.
+services:
+  - type: web
+    name: agent-surface
+    runtime: node
+    plan: free
+    # buildCommand / startCommand mirror package.json scripts byte-for-byte:
+    #   build -> "tsc", start -> "node dist/http.js".
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    # /health is never gated, so Render's health probe needs no token.
+    healthCheckPath: /health
+    envVars:
+      # Perimeter bearer token. Render generates a strong value; the app fails
+      # closed (exit 1) if this is unset on a hosted runtime (RENDER is set by
+      # the platform). This is perimeter auth only — it does NOT close ADR-0001's
+      # per-session threats S1/S2/T1/E1/I1.
+      - key: MCP_AUTH_TOKEN
+        generateValue: true
+      - key: LOG_LEVEL
+        value: info
+      # Pin the runtime to match .nvmrc / package.json engines.
+      - key: NODE_VERSION
+        value: "20"
+    # PORT is injected by Render and read via process.env.PORT; do not set it here.
